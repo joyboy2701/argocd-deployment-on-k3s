@@ -1,0 +1,77 @@
+#!/bin/bash
+set -euo pipefail
+
+dnf install -y awscli
+
+IMDS_TOKEN=$(curl -fsS --retry 5 -X PUT \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+  http://169.254.169.254/latest/api/token)
+REGION=$(curl -fsS -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+  http://169.254.169.254/latest/meta-data/placement/region)
+PUBLIC_IP=$(curl -fsS -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+  http://169.254.169.254/latest/meta-data/public-ipv4)
+
+# --------------------------------------------------
+# Install K3s server
+# --------------------------------------------------
+
+curl -sfL https://get.k3s.io | sh -s - server \
+  --write-kubeconfig-mode 600 \
+  --tls-san "$PUBLIC_IP" \
+  --node-name k3s-master
+
+# Wait until K3s is ready
+until sudo test -s /var/lib/rancher/k3s/server/node-token; do
+  sleep 5
+done
+
+# --------------------------------------------------
+# Store K3s node token in SSM
+# --------------------------------------------------
+
+TOKEN=$(sudo cat /var/lib/rancher/k3s/server/node-token)
+
+aws ssm put-parameter \
+  --name "${parameter_name}" \
+  --type "SecureString" \
+  --value "$TOKEN" \
+  --overwrite \
+  --region "$REGION"
+
+# --------------------------------------------------
+# Prepare kubeconfig
+# --------------------------------------------------
+
+KUBECONFIG="/tmp/k3s-kubeconfig"
+
+sudo cp /etc/rancher/k3s/k3s.yaml "$KUBECONFIG"
+
+# Replace localhost with the master's public IP
+sudo sed -i "s/127.0.0.1/$PUBLIC_IP/g" "$KUBECONFIG"
+
+sudo chmod 600 "$KUBECONFIG"
+
+# --------------------------------------------------
+# Store kubeconfig in SSM Parameter Store
+# --------------------------------------------------
+
+KUBECONFIG_VALUE=$(sudo cat "$KUBECONFIG")
+
+aws ssm put-parameter \
+  --name "${kubeconfig_parameter_name}" \
+  --type "SecureString" \
+  --tier Intelligent-Tiering \
+  --value "$KUBECONFIG_VALUE" \
+  --overwrite \
+  --region "$REGION"
+
+# Remove temporary kubeconfig
+sudo rm -f "$KUBECONFIG"
+
+# The K3s installer creates the kubectl symlink; do not overwrite it.
+
+touch /var/lib/k3s-bootstrap-complete
+
+echo "K3s master bootstrap completed."
+echo "K3s node token stored in SSM: ${parameter_name}"
+echo "K3s kubeconfig stored in SSM: ${kubeconfig_parameter_name}"

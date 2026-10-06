@@ -1,0 +1,30 @@
+#!/bin/bash
+set -euo pipefail
+
+dnf install -y awscli
+
+IMDS_TOKEN=$(curl -fsS --retry 5 -X PUT \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+  http://169.254.169.254/latest/api/token)
+REGION=$(curl -fsS -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+  http://169.254.169.254/latest/meta-data/placement/region)
+
+until TOKEN=$(aws ssm get-parameter \
+  --name "${cluster_parameter}" \
+  --with-decryption \
+  --query 'Parameter.Value' \
+  --output text \
+  --region "$REGION" 2>/dev/null) && [ -n "$TOKEN" ]; do
+  sleep 10
+done
+
+until curl -k -s https://${master_private_ip}:6443/version >/dev/null; do
+  sleep 10
+done
+
+curl -sfL https://get.k3s.io | K3S_URL="https://${master_private_ip}:6443" \
+  K3S_TOKEN="$TOKEN" \
+  sh -s - agent \
+  --node-name k3s-worker
+
+echo "K3s worker bootstrap completed."
